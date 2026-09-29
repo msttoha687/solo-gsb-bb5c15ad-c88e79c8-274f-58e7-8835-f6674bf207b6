@@ -50,7 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 1. 打开 http://localhost:8000 ，在左右两栏**粘贴**或点击「上传」选择旧版 / 新版 OpenAPI 文件（`.json` / `.yaml` / `.yml` 均可，也可混用）。
 2. （可选）在「开始审查」旁的输入框填写 **API 标识**——用于限时豁免匹配；留空则该审查不应用豁免。
-2. 可先点击内置示例：**典型破坏性变更 / 循环 $ref / 纯兼容新增 / 枚举约束收窄 / 认证要求收紧**。
+2. 可先点击内置示例：**典型破坏性变更 / 循环 $ref / 纯兼容新增 / 枚举约束收窄 / 认证要求收紧 / 响应头契约**。
 3. 点击「开始审查 →」。
 4. 结果区提供：
    - 顶部统计卡片与总体结论（✅ 向后兼容 / ❌ N 项破坏性变更）；
@@ -99,7 +99,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 \* 请求字段从契约移除时服务端可能开始忽略/拒绝，工具以兼容记录并在原因中注明。
 
-结构层面还覆盖：路径与操作的新增/删除、pathItem 级与操作级参数合并比较、参数必填性 / `style` / `explode` / `deprecated`、请求体必填性变化、媒体类型增删（请求 415 / 响应 Content-Type）、响应状态码增删、按**操作实际生效**的 `servers` 增删（操作级 → 路径级 → 根级优先，详见下文）、`operationId` 变化、`oneOf/anyOf` 分支增删等。
+结构层面还覆盖：路径与操作的新增/删除、pathItem 级与操作级参数合并比较、参数必填性 / `style` / `explode` / `deprecated`、请求体必填性变化、媒体类型增删（请求 415 / 响应 Content-Type）、响应状态码增删、**同状态码响应的响应头（headers）契约：头增删、必填性翻转、头 schema 按响应方向比较，头名忽略大小写、单侧大小写冲突报错、本地 `$ref` 解析、`required` 缺省按可选**（详见下文「📨 响应头契约」）、按**操作实际生效**的 `servers` 增删（操作级 → 路径级 → 根级优先，详见下文）、`operationId` 变化、`oneOf/anyOf` 分支增删等。
 
 ### 🔐 认证要求（security）兼容性
 
@@ -219,6 +219,62 @@ curl -X POST http://localhost:8000/api/reviews \
 - `GET /api/reviews/{id}` 返回的持久化结果、`GET /api/reviews/{id}/report?format=markdown|json` 报告与页面展示均包含同样的字段；新增 / 删除的路径或操作只出现 `path-*` / `operation-*`，不会附带服务器结论。
 
 > 页面内「规则说明」标签有完整列表；每条发现都带稳定的 `rule_id`（如 `property-became-required`、`enum-value-added`），便于在 CI 中按规则处理。
+
+### 📨 响应头（response headers）契约
+
+对**两版都存在的操作**，只在**同一响应状态码**两侧响应对象都存在时比较其 `headers`；整条响应为新增 / 删除时沿用 `response-added` / `response-removed` 的原结论，**不再重复生成头级发现**。
+
+- **头名忽略大小写**：按 HTTP 语义把头名转小写归组（`X-Trace-Id` 与 `x-trace-id` 视为同一个头）。**单侧**若出现仅大小写不同的重复头名（同一响应的 headers 里同时写了 `X-Foo` 与 `x-foo`），判为**文档冲突**（`response-header-name-conflict`，⚪ 信息）：逐条列出每个重复定义的物理 JSON Pointer，**不任选一份**，且该头不参与新旧逐对比较。
+- **本地 `$ref` 按目标定义解析**：头对象（`#/components/headers/...`）与响应对象自身（`#/components/responses/...`）的本地引用先解析到目标再比较；OpenAPI 3.1 中 `$ref` 包装节点上的 `required` / `schema` 等兄弟字段按覆盖语义参与。引用无法解析（悬空指针或外部引用）时给出 ⚪ 信息发现 `response-header-ref-unresolvable`（消息中注明是头对象还是响应对象的引用），**指出引用所在位置与无法解析原因，不生成任何猜测结论**，该头 / 该侧不参与比较。
+- **必填性**（`required` 缺省一律按**可选**处理）：
+
+| 变化 | 结论 | rule_id |
+| --- | --- | --- |
+| 旧头被移除（无论原必填 / 可选） | 🔴 破坏 | `response-header-removed` |
+| 原必填头变为可选（该头可能不再返回） | 🔴 破坏 | `response-header-became-optional` |
+| 新增头（必填或可选，服务端多返回头） | 🟢 兼容 | `response-header-added` |
+| 可选头变为必填（承诺更充分） | 🟢 兼容 | `response-header-became-required` |
+
+- **头 schema**：双方都声明 `schema` 的同名头，按现有**响应方向**规则递归比较——约束放宽（枚举取值增加、数值范围扩大、变 nullable 等）判 🔴 破坏，约束收窄判 🟢 兼容（规则编号与响应体 schema 完全一致，如 `enum-value-added` / `minimum-changed`）；仅一侧声明 schema 时不做 schema 比较。头对象引用本身无法解析时不猜测 schema。
+- **定位**：每条发现给出操作（`METHOD path`）、状态码（如 `responses[200].headers[X-Trace-Id]`）与两侧头定义的 JSON Pointer；内联头锚到 `paths/.../responses/{code}/headers/{name}`，引用头锚到 `/components/headers/{name}`（3.1 兄弟字段覆盖时锚回包装节点），响应对象为 `$ref` 时内联头锚到 `/components/responses/{name}/headers/...`。
+
+该类发现归类为 **响应头 / 响应方向（direction = response）**，自动接入级别 / 方向 / 分类（分类名「响应头」）/ 关键字**筛选**、Markdown / JSON **报告**、破坏项**限时豁免**、**破坏项对账**、**根因聚合**、**调用清单影响定位**与**最小复现包**（复现包会经 `$ref` 闭包保留被引用的 `components/headers` / `components/responses`）。内置示例「**响应头契约**」演示头移除、必填变可选、枚举放宽（破坏）与新增头、可选变必填（兼容）的组合。
+
+#### 响应头审查 HTTP 示例
+
+沿用现有审查接口，无需新增端点：`POST /api/reviews` 提交两份文档，结果 `findings` 中即含上述 `response-header-*` 发现。
+
+```bash
+curl -X POST http://localhost:8000/api/reviews \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "响应头契约示例",
+    "old_spec": "openapi: \"3.0.3\"\ninfo: {title: Orders, version: \"2.1.0\"}\npaths:\n  /orders/{id}:\n    get:\n      parameters:\n        - {name: id, in: path, required: true, schema: {type: string}}\n      responses:\n        \"200\":\n          description: ok\n          headers:\n            X-Trace-Id: {required: true, schema: {type: string}}\n            X-Poll: {schema: {type: integer, enum: [5, 10, 30]}}\n            X-Legacy: {schema: {type: string}}\n",
+    "new_spec": "openapi: \"3.0.3\"\ninfo: {title: Orders, version: \"2.2.0\"}\npaths:\n  /orders/{id}:\n    get:\n      parameters:\n        - {name: id, in: path, required: true, schema: {type: string}}\n      responses:\n        \"200\":\n          description: ok\n          headers:\n            X-Trace-Id: {schema: {type: string}}\n            X-Poll: {schema: {type: integer, enum: [5, 10, 30, 60]}}\n            X-New: {schema: {type: string}}\n"
+  }'
+```
+
+同状态码 `200` 下：必填头 `X-Trace-Id` 变可选（🔴）、`X-Poll` 枚举增加 `60`（响应方向放宽，🔴）、`X-Legacy` 被移除（🔴）、新增 `X-New`（🟢），响应节选：
+
+```json
+{
+  "summary": { "compatible": false, "by_category": { "响应头": 4 } },
+  "findings": [
+    {
+      "rule_id": "response-header-became-optional",
+      "severity": "breaking",
+      "category": "响应头",
+      "direction": "response",
+      "endpoint": "GET /orders/{id}",
+      "location": "responses[200].headers[X-Trace-Id].required",
+      "old_json_path": "/paths/orders~1{id}/get/responses/200/headers/X-Trace-Id/required",
+      "new_json_path": "/paths/orders~1{id}/get/responses/200/headers/X-Trace-Id/required",
+      "old_value": true,
+      "new_value": false
+    }
+  ]
+}
+```
 
 ### `$ref` 与循环引用处理
 
@@ -669,7 +725,7 @@ curl -X POST http://localhost:8000/api/reviews/1/link-preview \
 │   ├── main.py        # FastAPI：审查 / 历史 / 引用树 / 根因聚合 / 破坏项对账 / 组件可达性审计 / 调用清单影响定位 / 请求样本回放 / Link 参数预览 / 限时豁免 / 报告下载 / 健康检查接口
 │   ├── parser.py      # JSON·YAML 载入与 OpenAPI 3.x 校验
 │   ├── refs.py        # JSON Pointer、$ref 解析、循环安全的引用展开树
-│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求 + 操作级/路径级/根级 servers 生效地址比较）
+│   ├── diff.py        # 语义兼容性规则引擎（请求/响应双方向 + 操作级/根级 security 认证要求 + 操作级/路径级/根级 servers 生效地址比较 + 同状态码响应头 headers 契约：头增删/必填翻转/头schema响应方向比较/忽略大小写/单侧大小写冲突/本地$ref解析）
 │   ├── groups.py      # 根因聚合：端点×方向分区、同源归并、祖先吸收的有向影响组
 │   ├── reconcile.py   # 破坏项对账：稳定身份配对，输出新增 / 延续 / 已消失
 │   ├── reachability.py # 组件可达性审计：paths/webhooks 入口 → 本地 $ref 传递追踪，未触达组件与无效引用
@@ -684,7 +740,7 @@ curl -X POST http://localhost:8000/api/reviews/1/link-preview \
 │   ├── index.html     # 单页界面
 │   ├── styles.css
 │   ├── app.js         # 原生 JS：筛选 / 聚合视图 / 展开树 / 历史 / 对账 / 调用清单导入 / 请求样本回放 / Link 参数预览 / 下载
-│   └── samples.js     # 五组内置示例（JSON + YAML，含认证要求收紧）
+│   └── samples.js     # 六组内置示例（JSON + YAML，含认证要求收紧、响应头契约）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -694,7 +750,7 @@ curl -X POST http://localhost:8000/api/reviews/1/link-preview \
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, api_id?, ...}` 执行审查并持久化（响应含豁免视图）；`server-removed` / `server-added` 按每个共同操作的**实际生效** servers（操作级 → 路径级 → 根级 → 默认 `/`）报告，调用示例见下文「🌐 服务器地址审查 HTTP 示例」 |
+| `POST` | `/api/reviews` | 提交 `{old_spec, new_spec, api_id?, ...}` 执行审查并持久化（响应含豁免视图）；`server-removed` / `server-added` 按每个共同操作的**实际生效** servers（操作级 → 路径级 → 根级 → 默认 `/`）报告，调用示例见下文「🌐 服务器地址审查 HTTP 示例」；同状态码响应的 `response-header-*` 头契约发现（头增删 / 必填翻转 / 头 schema 响应方向比较 / 大小写冲突 / 引用无法解析）调用示例见下文「📨 响应头审查 HTTP 示例」 |
 | `GET` | `/api/reviews` | 历史审查列表 |
 | `GET` | `/api/reviews/{id}` | 审查详情（含全部 findings 与实时豁免视图） |
 | `PATCH` | `/api/reviews/{id}` | 设置 / 清除审查的 API 标识 `{api_id}` |

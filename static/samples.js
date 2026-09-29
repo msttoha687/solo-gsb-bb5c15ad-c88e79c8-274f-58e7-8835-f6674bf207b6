@@ -611,5 +611,80 @@ components:
         priority: { type: string, enum: [low, normal, high, urgent, critical] }
         state: { type: string, enum: [open, closed, archived] }
 `
+  },
+
+  headers: {
+    old: `openapi: 3.0.3
+info: { title: "Orders", version: "2.1.0" }
+paths:
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 订单详情
+          headers:
+            X-RateLimit-Remaining:
+              required: true
+              schema: { type: integer, minimum: 0 }
+            X-Trace-Id:
+              schema: { type: string }
+            X-Poll-Interval:
+              schema: { type: integer, enum: [5, 10, 30] }
+            X-Legacy-Token:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+components:
+  schemas:
+    Order:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [pending, paid] }
+`,
+    new: `openapi: 3.0.3
+info: { title: "Orders", version: "2.2.0" }
+paths:
+  /orders/{id}:
+    get:
+      operationId: getOrder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: 订单详情
+          headers:
+            X-RateLimit-Remaining:
+              schema: { type: integer, minimum: 0 }
+            X-Trace-Id:
+              required: true
+              schema: { type: string }
+            X-Poll-Interval:
+              schema: { type: integer, enum: [5, 10, 30, 60] }
+            X-New-Feature:
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+components:
+  schemas:
+    Order:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [pending, paid] }
+`
   }
 };
