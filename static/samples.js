@@ -610,6 +610,53 @@ components:
         id: { type: string }
         priority: { type: string, enum: [low, normal, high, urgent, critical] }
         state: { type: string, enum: [open, closed, archived] }
-`
+`,
+
+  /* 响应头契约变更：旧头移除/必填变可选（破坏）、新增头/可选变必填（兼容）、
+     头 schema 枚举放宽（响应方向破坏）；整响应 204 删除与 400 新增沿用
+     response-removed / response-added，不重复生成头发现。 */
+  headers: {
+    old: `openapi: 3.0.3
+info: { title: "Pets", version: "1.4.0" }
+paths:
+  /pets:
+    get:
+      responses:
+        '200':
+          description: 宠物列表
+          headers:
+            X-Trace-Id:
+              required: true
+              schema: { type: string }
+            X-Poll-Interval:
+              schema: { type: integer }
+            X-Channel:
+              schema: { type: string, enum: [stable, beta] }
+            X-Deprecated-Header:
+              schema: { type: string }
+        '204':
+          description: 旧版独有的空响应
+    `,
+    new: `openapi: 3.0.3
+info: { title: "Pets", version: "2.0.0" }
+paths:
+  /pets:
+    get:
+      responses:
+        '200':
+          description: 宠物列表
+          headers:
+            X-Trace-Id:
+              schema: { type: string }
+            X-Poll-Interval:
+              required: true
+              schema: { type: integer }
+            X-Channel:
+              schema: { type: string, enum: [stable, beta, canary] }
+            X-Rate-Limit-Remaining:
+              schema: { type: integer }
+        '400':
+          description: 新版新增的错误响应
+    `
   }
 };

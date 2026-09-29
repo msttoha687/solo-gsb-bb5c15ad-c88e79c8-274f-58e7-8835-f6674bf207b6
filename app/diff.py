@@ -957,15 +957,36 @@ class Engine:
             )
 
         for code in sorted(old_codes & new_codes):
-            old_r, old_ref = self._target(self.old, old_resp[code])
-            new_r, new_ref = self._target(self.new, new_resp[code])
+            resp_base = f"{base}/responses/{encode_token(str(code))}"
+            old_r, old_ref, old_bad = self._resolve_local_object(
+                self.old, old_resp[code]
+            )
+            new_r, new_ref, new_bad = self._resolve_local_object(
+                self.new, new_resp[code]
+            )
+            # 响应对象的本地 $ref 无法解析时指出位置，不生成猜测结论
+            # （整响应新增 / 删除另由 response-added/removed 覆盖）。
+            if old_bad:
+                self._unresolved_response_ref_finding(
+                    endpoint, code, resp_base, "old",
+                    _ref_of(old_resp[code]),
+                )
+            if new_bad:
+                self._unresolved_response_ref_finding(
+                    endpoint, code, resp_base, "new",
+                    _ref_of(new_resp[code]),
+                )
+            # 任一侧响应对象无法解析：指出位置后跳过整条响应比较
+            # （头 / 内容都不生成猜测结论）。
+            if old_bad or new_bad:
+                continue
             if not isinstance(old_r, dict) or not isinstance(new_r, dict):
                 continue
             common = dict(
                 category="响应", direction="response", change="changed",
                 endpoint=endpoint, location=f"responses[{code}]",
-                old_json_path=f"{base}/responses/{encode_token(str(code))}",
-                new_json_path=f"{base}/responses/{encode_token(str(code))}",
+                old_json_path=resp_base,
+                new_json_path=resp_base,
                 old_ref=old_ref, new_ref=new_ref,
             )
             if not new_r.get("deprecated", False) and old_r.get("deprecated", False):
@@ -981,12 +1002,359 @@ class Engine:
                     old_value=False, new_value=True, **common,
                 )
 
+            self._compare_response_headers(
+                endpoint, code, resp_base, old_r, new_r, old_ref, new_ref
+            )
+
             self._compare_content(
                 old_r.get("content"), new_r.get("content"),
                 "response", endpoint,
-                f"{base}/responses/{encode_token(str(code))}",
+                resp_base,
                 f"responses[{code}]", old_ref, new_ref,
             )
+
+    # ------------------------------------------------------------------ #
+    # 响应头
+    # ------------------------------------------------------------------ #
+    def _resolve_local_object(
+        self, doc: dict[str, Any], node: Any
+    ) -> tuple[Any, str | None, str | None]:
+        """按目标定义解析节点的本地 $ref（响应 / 头对象共用）。
+
+        与 _target 不同：无法解析（外部引用、指针不存在、目标非对象）时
+        返回 bad_ref=$ref 值而不是静默返回原节点，供调用方"指出位置、
+        不生成猜测结论"。非引用节点返回 (node, None, None)。
+        """
+        ref = node.get("$ref") if isinstance(node, dict) else None
+        if not isinstance(ref, str):
+            return node, None, None
+        try:
+            from .refs import normalize_pointer
+            pointer = normalize_pointer(ref)
+            target = resolve_pointer(doc, pointer)
+        except KeyError:  # normalize_pointer / resolve_pointer 无法解析
+            return node, None, ref
+        if not isinstance(target, dict):
+            return node, None, ref
+        return target, pointer, None
+
+    def _unresolved_response_ref_finding(
+        self,
+        endpoint: str,
+        code: str,
+        resp_base: str,
+        side: str,
+        ref: str | None,
+    ) -> None:
+        side_cn = "旧版" if side == "old" else "新版"
+        self.add(
+            rule_id="response-ref-unresolved", severity=INFO,
+            category="响应", direction="response", change="changed",
+            endpoint=endpoint,
+            location=f"responses[{code}]（{side_cn}响应引用无法解析）",
+            old_json_path=resp_base if side == "old" else None,
+            new_json_path=resp_base if side == "new" else None,
+            old_ref=ref if side == "old" else None,
+            new_ref=ref if side == "new" else None,
+            message=(
+                f"响应 {code} 的 {side_cn}本地 $ref {ref!r} 无法解析"
+                "（外部引用或目标不存在），该响应的响应头与内容无法比较，"
+                "未生成任何猜测结论。"
+            ),
+            old_value=ref if side == "old" else None,
+            new_value=ref if side == "new" else None,
+        )
+
+    def _collect_headers(
+        self, doc: dict[str, Any], headers: Any, hbase: str
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
+        """收集一个响应的 headers：头名不区分大小写。
+
+        hbase 为本侧响应对象的锚点（响应为 $ref 时是目标组件指针，否则是
+        内联 responses[code] 指针），头对象路径据此定位。
+
+        返回 (entries, conflicts)：
+        - entries: lower(name) -> {name, node(已解析目标), ref, pointer}，
+          单侧同一 lower(name) 只有一个键时才收录；
+        - conflicts: lower(name) -> [原始键名…]，单侧仅大小写不同的重复
+          定义视为文档冲突，列出全部原始键名，不任选一份。
+        """
+        entries: dict[str, dict[str, Any]] = {}
+        raw_groups: dict[str, list[str]] = {}
+        if isinstance(headers, dict):
+            for raw_name in headers:
+                raw_groups.setdefault(str(raw_name).lower(), []).append(str(raw_name))
+
+        conflicts = {
+            lower: names for lower, names in raw_groups.items() if len(names) > 1
+        }
+        for lower, names in raw_groups.items():
+            if lower in conflicts:
+                continue
+            raw_name = names[0]
+            raw_node = headers[raw_name]
+            pointer = f"{hbase}/headers/{encode_token(raw_name)}"
+            node, ref, bad = self._resolve_local_object(doc, raw_node)
+            entries[lower] = {
+                "name": raw_name,
+                "node": node,
+                "ref": ref,
+                "bad_ref": bad,
+                "pointer": pointer,
+            }
+        return entries, conflicts
+
+    def _compare_response_headers(
+        self,
+        endpoint: str,
+        code: str,
+        resp_base: str,
+        old_resp: dict[str, Any],
+        new_resp: dict[str, Any],
+        old_resp_ref: str | None,
+        new_resp_ref: str | None,
+    ) -> None:
+        """比较两版同一操作同一状态码响应的 headers（仅此场景会走到这里）。
+
+        规则：
+        - 仅比较两版共有的状态码响应；整条响应新增 / 删除由
+          response-added / response-removed 覆盖，不重复生成头发现；
+        - 头名不区分大小写；单侧仅大小写不同的重复定义视为文档冲突，
+          指出位置而不任选一份，冲突的头不参与配对比较；
+        - 旧头移除、原必填头变可选：破坏；新增头、可选变必填：兼容；
+          required 缺省按可选；
+        - 双方均声明 schema 的共有头按响应方向规则比较（放宽破坏、收窄兼容）；
+        - 本地 $ref 无法解析时指出位置，不生成猜测结论。
+        """
+        # 各侧头对象的定位锚点：响应本身为 $ref 时锚到目标响应组件
+        old_hbase = old_resp_ref or resp_base
+        new_hbase = new_resp_ref or resp_base
+        old_entries, old_conflicts = self._collect_headers(
+            self.old, old_resp.get("headers"), old_hbase
+        )
+        new_entries, new_conflicts = self._collect_headers(
+            self.new, new_resp.get("headers"), new_hbase
+        )
+
+        for lower in sorted(set(old_conflicts) | set(new_conflicts)):
+            self._header_conflict_finding(
+                endpoint, code, old_hbase, new_hbase, lower,
+                old_conflicts.get(lower), new_conflicts.get(lower),
+            )
+
+        old_keys, new_keys = set(old_entries), set(new_entries)
+        # 任一侧存在大小写重复定义冲突的头名整体不参与配对（不任选一份）
+        conflict_names = set(old_conflicts) | set(new_conflicts)
+
+        # 新增头（新版独有）：兼容（响应保证返回更多数据）
+        for lower in sorted(new_keys - old_keys):
+            if lower in conflict_names:
+                continue
+            e = new_entries[lower]
+            # 引用无法解析：指出位置，不给新增结论
+            if e["bad_ref"]:
+                self._unresolved_header_ref_finding(
+                    endpoint, code, "new", e["name"], e["pointer"], e["bad_ref"]
+                )
+                continue
+            h = e["node"]
+            required = bool(h.get("required"))
+            self.add(
+                rule_id="response-header-added", severity=NON_BREAKING,
+                category="响应", direction="response", change="added",
+                endpoint=endpoint,
+                location=f"responses[{code}] → 响应头 {e['name']}",
+                old_json_path=None, new_json_path=e["pointer"],
+                old_ref=None, new_ref=e["ref"],
+                message=(
+                    f"响应 {code} 新增{'必填' if required else ''}响应头 "
+                    f"'{e['name']}'，现有客户端可获得更多数据（严格校验响应头"
+                    "的客户端需确认是否容忍新头）。"
+                ),
+                old_value=None, new_value=_header_brief(h),
+            )
+
+        # 移除旧头：破坏（客户端可能依赖该头）
+        for lower in sorted(old_keys - new_keys):
+            if lower in conflict_names:
+                continue
+            e = old_entries[lower]
+            if e["bad_ref"]:
+                self._unresolved_header_ref_finding(
+                    endpoint, code, "old", e["name"], e["pointer"], e["bad_ref"]
+                )
+                continue
+            h = e["node"]
+            self.add(
+                rule_id="response-header-removed", severity=BREAKING,
+                category="响应", direction="response", change="removed",
+                endpoint=endpoint,
+                location=f"responses[{code}] → 响应头 {e['name']}",
+                old_json_path=e["pointer"], new_json_path=None,
+                old_ref=e["ref"], new_ref=None,
+                message=(
+                    f"响应 {code} 移除响应头 '{e['name']}'，依赖该响应头的"
+                    "客户端可能失效。"
+                ),
+                old_value=_header_brief(h), new_value=None,
+            )
+
+        # 共有头：required 翻转 + 双方均声明 schema 时按响应方向比较
+        for lower in sorted(old_keys & new_keys):
+            if lower in conflict_names:
+                continue
+            oe, ne = old_entries[lower], new_entries[lower]
+            if oe["bad_ref"]:
+                self._unresolved_header_ref_finding(
+                    endpoint, code, "old", oe["name"], oe["pointer"], oe["bad_ref"]
+                )
+            if ne["bad_ref"]:
+                self._unresolved_header_ref_finding(
+                    endpoint, code, "new", ne["name"], ne["pointer"], ne["bad_ref"]
+                )
+            if oe["bad_ref"] or ne["bad_ref"]:
+                continue
+            old_h, new_h = oe["node"], ne["node"]
+            if not isinstance(old_h, dict) or not isinstance(new_h, dict):
+                continue
+            self._compare_response_header(
+                endpoint, code, oe, ne, old_h, new_h
+            )
+
+    def _compare_response_header(
+        self,
+        endpoint: str,
+        code: str,
+        oe: dict[str, Any],
+        ne: dict[str, Any],
+        old_h: dict[str, Any],
+        new_h: dict[str, Any],
+    ) -> None:
+        """比较单个共有响应头：必填性翻转 + schema（双方均声明时）。"""
+        name = ne["name"] or oe["name"]
+        # 两侧键名拼写不同（仅大小写差异）：HTTP 头名不区分大小写，按同一头
+        # 比较，并在定位中保留两侧原始拼写。
+        display_name = oe["name"] if oe["name"] == ne["name"] else (
+            f"{oe['name']} / {ne['name']}"
+        )
+        common = dict(
+            category="响应", direction="response",
+            endpoint=endpoint,
+            location=f"responses[{code}] → 响应头 {display_name}",
+        )
+        old_required = bool(old_h.get("required"))
+        new_required = bool(new_h.get("required"))
+        if new_required and not old_required:
+            # 可选 → 必填：响应方向兼容（保证该头一定存在）
+            self.add(
+                rule_id="response-header-became-required", severity=NON_BREAKING,
+                change="changed",
+                old_json_path=oe["pointer"] + "/required",
+                new_json_path=ne["pointer"] + "/required",
+                old_ref=oe["ref"], new_ref=ne["ref"],
+                message=(
+                    f"响应 {code} 的响应头 '{name}' 由可选变为必填，"
+                    "服务端承诺该头一定返回，属于增强。"
+                ),
+                old_value=False, new_value=True, **common,
+            )
+        elif old_required and not new_required:
+            # 必填 → 可选：响应方向破坏（该头可能不再返回）
+            self.add(
+                rule_id="response-header-became-optional", severity=BREAKING,
+                change="changed",
+                old_json_path=oe["pointer"] + "/required",
+                new_json_path=ne["pointer"] + "/required",
+                old_ref=oe["ref"], new_ref=ne["ref"],
+                message=(
+                    f"响应 {code} 的响应头 '{name}' 由必填变为可选，"
+                    "该头可能不再返回，依赖它的客户端需要处理缺失。"
+                ),
+                old_value=True, new_value=False, **common,
+            )
+
+        old_schema = old_h.get("schema")
+        new_schema = new_h.get("schema")
+        if isinstance(old_schema, dict) and isinstance(new_schema, dict):
+            ctx = Ctx(
+                direction="response", endpoint=endpoint,
+                base=oe["pointer"],
+                loc=f"responses[{code}] > header {display_name}",
+                old_ref=oe["ref"], new_ref=ne["ref"],
+                category="响应 Schema",
+                old_suffix=["schema"], new_suffix=["schema"],
+                old_base=oe["pointer"], new_base=ne["pointer"],
+            )
+            self._compare_schema(old_schema, new_schema, ctx)
+
+    def _header_conflict_finding(
+        self,
+        endpoint: str,
+        code: str,
+        old_hbase: str,
+        new_hbase: str,
+        lower: str,
+        old_names: list[str] | None,
+        new_names: list[str] | None,
+    ) -> None:
+        """单侧仅大小写不同的重复头定义：文档冲突，指出位置而不任选一份。"""
+        details = []
+        if old_names:
+            details.append("旧版 " + "、".join(repr(n) for n in old_names))
+        if new_names:
+            details.append("新版 " + "、".join(repr(n) for n in new_names))
+        self.add(
+            rule_id="response-header-name-conflict", severity=INFO,
+            category="响应", direction="response", change="changed",
+            endpoint=endpoint,
+            location=f"responses[{code}] → 响应头 {lower}（大小写重复定义冲突）",
+            old_json_path=(
+                f"{old_hbase}/headers/{encode_token(old_names[0])}"
+                if old_names else None
+            ),
+            new_json_path=(
+                f"{new_hbase}/headers/{encode_token(new_names[0])}"
+                if new_names else None
+            ),
+            old_ref=None, new_ref=None,
+            message=(
+                f"响应 {code} 的响应头名称 '{lower}' 存在仅大小写不同的重复定义"
+                f"（{'；'.join(details)}）。HTTP 头名不区分大小写，这属于文档冲突，"
+                "已列出全部定义位置而未任选一份；该头未参与双侧比较，请人工修正文档。"
+            ),
+            old_value=old_names, new_value=new_names,
+        )
+
+    def _unresolved_header_ref_finding(
+        self,
+        endpoint: str,
+        code: str,
+        side: str,
+        name: str,
+        pointer: str,
+        ref: str,
+    ) -> None:
+        """头对象的本地 $ref 无法解析：指出位置，不生成猜测结论。"""
+        side_cn = "旧版" if side == "old" else "新版"
+        self.add(
+            rule_id="response-header-ref-unresolved", severity=INFO,
+            category="响应", direction="response", change="changed",
+            endpoint=endpoint,
+            location=(
+                f"responses[{code}] → 响应头 {name}（{side_cn}头引用无法解析）"
+            ),
+            old_json_path=pointer if side == "old" else None,
+            new_json_path=pointer if side == "new" else None,
+            old_ref=ref if side == "old" else None,
+            new_ref=ref if side == "new" else None,
+            message=(
+                f"响应 {code} 的 {side_cn}响应头 '{name}' 的本地 $ref "
+                f"{ref!r} 无法解析（外部引用或目标不存在），未对该头生成"
+                "任何猜测结论。"
+            ),
+            old_value=ref if side == "old" else None,
+            new_value=ref if side == "new" else None,
+        )
 
     # ------------------------------------------------------------------ #
     # MediaType 容器（request / response 共用）
@@ -1724,6 +2092,9 @@ class Ctx:
     segments: list[str] = field(default_factory=list)   # 载荷内路径段（显示用）
     old_suffix: list[str] = field(default_factory=list)
     new_suffix: list[str] = field(default_factory=list)
+    # 两侧内联声明位置不同（如响应头比较）时，可分别指定无 ref 锚点一侧的 base
+    old_base: str | None = None
+    new_base: str | None = None
 
     def child(self, display: str, suffix: str | None) -> "Ctx":
         suf = suffix or display
@@ -1735,6 +2106,7 @@ class Ctx:
             segments=self.segments + [display],
             old_suffix=self.old_suffix + [suf],
             new_suffix=self.new_suffix + [suf],
+            old_base=self.old_base, new_base=self.new_base,
         )
 
     def entered_ref(self, old_ref: str | None, new_ref: str | None) -> "Ctx":
@@ -1755,6 +2127,7 @@ class Ctx:
             segments=list(self.segments),
             old_suffix=[] if old_changed else list(self.old_suffix),
             new_suffix=[] if new_changed else list(self.new_suffix),
+            old_base=self.old_base, new_base=self.new_base,
         )
 
     def path_display(self) -> str:
@@ -1775,11 +2148,11 @@ class Ctx:
         return out
 
     def old_json_path(self) -> str:
-        anchor = self.old_ref if self.old_ref else self.base
+        anchor = self.old_ref if self.old_ref else (self.old_base or self.base)
         return anchor + self._suffix(self.old_suffix)
 
     def new_json_path(self) -> str:
-        anchor = self.new_ref if self.new_ref else self.base
+        anchor = self.new_ref if self.new_ref else (self.new_base or self.base)
         return anchor + self._suffix(self.new_suffix)
 
 
@@ -2003,6 +2376,26 @@ def _param_brief(p: dict) -> dict:
         "required": bool(p.get("required")),
         "deprecated": bool(p.get("deprecated")),
     }
+
+
+def _header_brief(h: dict) -> dict:
+    """响应头发现项的旧值 / 新值摘要。"""
+    brief: dict[str, Any] = {
+        "required": bool(h.get("required")),
+        "deprecated": bool(h.get("deprecated")),
+    }
+    schema = h.get("schema")
+    if isinstance(schema, dict):
+        t = schema.get("type")
+        if isinstance(t, str):
+            brief["type"] = t
+        elif isinstance(t, list):
+            brief["type"] = list(t)
+        if schema.get("format"):
+            brief["format"] = schema["format"]
+        if isinstance(schema.get("enum"), list):
+            brief["enum"] = schema["enum"]
+    return brief
 
 
 def _schema_brief(info: SInfo) -> dict:

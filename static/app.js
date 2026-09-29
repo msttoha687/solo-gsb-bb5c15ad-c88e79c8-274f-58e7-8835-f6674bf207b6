@@ -1916,6 +1916,18 @@
       ],
     },
     {
+      title: "响应头（responses.headers，响应方向）",
+      items: [
+        "仅比较两版<b>共有操作的同一状态码</b>响应；整条响应新增 / 删除沿用 response-added / response-removed，不重复生成头发现",
+        "响应与头对象的本地 <code>$ref</code> 按目标定义解析；无法解析（外部引用 / 目标缺失）时指出位置，不生成猜测结论",
+        "头名不区分大小写；<b>单侧仅大小写不同的重复定义</b>视为文档冲突（<code>response-header-name-conflict</code>，⚪ 信息），列出位置而不任选一份，冲突头不参与比较",
+        "<code>移除旧响应头</code>：🔴 <code>response-header-removed</code>；新增响应头：🟢 <code>response-header-added</code>",
+        "<code>必填 → 可选</code>：🔴 <code>response-header-became-optional</code>（该头可能不再返回）；可选 → 必填：🟢 <code>response-header-became-required</code>",
+        "<code>required</code> 缺省按可选处理",
+        "双方均声明 <code>schema</code> 的共有头按响应方向规则比较：<b>放宽破坏、收窄兼容</b>（如枚举取值增加 🔴、增加上界 🟢）",
+      ],
+    },
+    {
       title: "状态码与媒体类型",
       items: [
         "<code>删除 2xx 响应</code>：🔴；新增成功响应：🟢",
